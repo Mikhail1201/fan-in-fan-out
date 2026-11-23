@@ -1,0 +1,8 @@
+.aws-sam/
+layer/python/
+__pycache__/
+*.pyc
+*.zip
+.venv/
+.vscode/
+.idea/

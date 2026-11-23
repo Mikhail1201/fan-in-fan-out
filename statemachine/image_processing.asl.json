@@ -1,0 +1,296 @@
+{
+  "Comment": "Fan-Out (Parallel) y Fan-In (Consolidate) para procesamiento de imagenes",
+  "StartAt": "Prepare",
+  "States": {
+    "Prepare": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${PrepareFunctionArn}",
+        "Payload.$": "$"
+      },
+      "OutputPath": "$.Payload",
+      "TimeoutSeconds": 30,
+      "Retry": [
+        {
+          "ErrorEquals": ["InvalidImageError"],
+          "MaxAttempts": 0
+        },
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException",
+            "States.Timeout"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "InvalidInput"
+        }
+      ],
+      "Next": "FanOut"
+    },
+
+    "FanOut": {
+      "Type": "Parallel",
+      "Comment": "FAN-OUT: las 4 ramas se ejecutan en paralelo con la misma entrada",
+      "ResultPath": "$.results",
+      "Branches": [
+        {
+          "StartAt": "Thumbnail",
+          "States": {
+            "Thumbnail": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${ThumbnailFunctionArn}",
+                "Payload.$": "$"
+              },
+              "OutputPath": "$.Payload",
+              "TimeoutSeconds": 90,
+              "Retry": [
+                {
+                  "ErrorEquals": ["InvalidImageError"],
+                  "MaxAttempts": 0
+                },
+                {
+                  "ErrorEquals": [
+                    "Lambda.ServiceException",
+                    "Lambda.AWSLambdaException",
+                    "Lambda.SdkClientException",
+                    "Lambda.TooManyRequestsException",
+                    "States.TaskFailed",
+                    "States.Timeout"
+                  ],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0,
+                  "JitterStrategy": "FULL"
+                }
+              ],
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "WebVersion",
+          "States": {
+            "WebVersion": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${WebFunctionArn}",
+                "Payload.$": "$"
+              },
+              "OutputPath": "$.Payload",
+              "TimeoutSeconds": 90,
+              "Retry": [
+                {
+                  "ErrorEquals": ["InvalidImageError"],
+                  "MaxAttempts": 0
+                },
+                {
+                  "ErrorEquals": [
+                    "Lambda.ServiceException",
+                    "Lambda.AWSLambdaException",
+                    "Lambda.SdkClientException",
+                    "Lambda.TooManyRequestsException",
+                    "States.TaskFailed",
+                    "States.Timeout"
+                  ],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0,
+                  "JitterStrategy": "FULL"
+                }
+              ],
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "MobileVersion",
+          "States": {
+            "MobileVersion": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${MobileFunctionArn}",
+                "Payload.$": "$"
+              },
+              "OutputPath": "$.Payload",
+              "TimeoutSeconds": 90,
+              "Retry": [
+                {
+                  "ErrorEquals": ["InvalidImageError"],
+                  "MaxAttempts": 0
+                },
+                {
+                  "ErrorEquals": [
+                    "Lambda.ServiceException",
+                    "Lambda.AWSLambdaException",
+                    "Lambda.SdkClientException",
+                    "Lambda.TooManyRequestsException",
+                    "States.TaskFailed",
+                    "States.Timeout"
+                  ],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0,
+                  "JitterStrategy": "FULL"
+                }
+              ],
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "ExtractMetadata",
+          "States": {
+            "ExtractMetadata": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${MetadataFunctionArn}",
+                "Payload.$": "$"
+              },
+              "OutputPath": "$.Payload",
+              "TimeoutSeconds": 90,
+              "Retry": [
+                {
+                  "ErrorEquals": ["InvalidImageError"],
+                  "MaxAttempts": 0
+                },
+                {
+                  "ErrorEquals": [
+                    "Lambda.ServiceException",
+                    "Lambda.AWSLambdaException",
+                    "Lambda.SdkClientException",
+                    "Lambda.TooManyRequestsException",
+                    "States.TaskFailed",
+                    "States.Timeout"
+                  ],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0,
+                  "JitterStrategy": "FULL"
+                }
+              ],
+              "End": true
+            }
+          }
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "HandleFailure"
+        }
+      ],
+      "Next": "FanIn"
+    },
+
+    "FanIn": {
+      "Type": "Task",
+      "Comment": "FAN-IN: recibe el arreglo con los 4 resultados y genera el reporte final",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${ConsolidateFunctionArn}",
+        "Payload": {
+          "mode": "success",
+          "imageId.$": "$.imageId",
+          "bucket.$": "$.bucket",
+          "key.$": "$.key",
+          "executionId.$": "$$.Execution.Name",
+          "results.$": "$.results"
+        }
+      },
+      "OutputPath": "$.Payload",
+      "TimeoutSeconds": 30,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException",
+            "States.Timeout"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "HandleFailure"
+        }
+      ],
+      "Next": "Completed"
+    },
+
+    "Completed": {
+      "Type": "Succeed"
+    },
+
+    "HandleFailure": {
+      "Type": "Task",
+      "Comment": "Escribe un reporte con status FAILED para que el fallo quede registrado",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${ConsolidateFunctionArn}",
+        "Payload": {
+          "mode": "failure",
+          "imageId.$": "$.imageId",
+          "bucket.$": "$.bucket",
+          "key.$": "$.key",
+          "executionId.$": "$$.Execution.Name",
+          "error.$": "$.error"
+        }
+      },
+      "ResultPath": null,
+      "TimeoutSeconds": 30,
+      "Retry": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": null,
+          "Next": "ProcessingFailed"
+        }
+      ],
+      "Next": "ProcessingFailed"
+    },
+
+    "ProcessingFailed": {
+      "Type": "Fail",
+      "Error": "ImageProcessingFailed",
+      "Cause": "Una o mas ramas fallaron tras agotar los reintentos. Revisar el reporte FAILED en S3 y los logs de CloudWatch. Se puede reprocesar con scripts/reprocess.py."
+    },
+
+    "InvalidInput": {
+      "Type": "Fail",
+      "Error": "InvalidInput",
+      "Cause": "El objeto no cumple las reglas de entrada (prefijo uploads/ y extension jpg, jpeg, png o webp)."
+    }
+  }
+}

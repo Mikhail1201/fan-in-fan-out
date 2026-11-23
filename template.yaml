@@ -1,0 +1,290 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Procesamiento de imagenes serverless con patrones Fan-Out y Fan-In.
+  S3 -> EventBridge -> Step Functions (Parallel) -> 4 Lambdas -> Lambda consolidadora -> reporte JSON en S3.
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [x86_64]
+    Timeout: 30
+    MemorySize: 256
+    LoggingConfig:
+      LogFormat: JSON
+      ApplicationLogLevel: INFO
+      SystemLogLevel: WARN
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # Almacenamiento: un bucket con tres prefijos (uploads/, processed/, reports/)
+  # ---------------------------------------------------------------------------
+  ImagesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-images-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      # Publica todos los eventos del bucket en EventBridge (origen del Fan-Out)
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+
+  # ---------------------------------------------------------------------------
+  # Capa con Pillow (se construye con scripts/build_layer.ps1, sin Docker)
+  # ---------------------------------------------------------------------------
+  PillowLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub '${AWS::StackName}-pillow'
+      Description: Pillow para Python 3.12 (x86_64)
+      ContentUri: layer/
+      CompatibleRuntimes: [python3.12]
+      CompatibleArchitectures: [x86_64]
+
+  # ---------------------------------------------------------------------------
+  # Grupos de logs (CloudWatch) con retencion explicita
+  # ---------------------------------------------------------------------------
+  PrepareLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-prepare'
+      RetentionInDays: 14
+  ThumbnailLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-thumbnail'
+      RetentionInDays: 14
+  WebLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-web'
+      RetentionInDays: 14
+  MobileLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-mobile'
+      RetentionInDays: 14
+  MetadataLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-metadata'
+      RetentionInDays: 14
+  ConsolidateLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-consolidate'
+      RetentionInDays: 14
+  StateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/vendedlogs/states/${AWS::StackName}-image-processing'
+      RetentionInDays: 14
+
+  # ---------------------------------------------------------------------------
+  # Lambdas
+  # ---------------------------------------------------------------------------
+  PrepareFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-prepare'
+      Description: Valida el evento de S3 y calcula el imageId
+      CodeUri: src/prepare/
+      Handler: app.handler
+      LoggingConfig:
+        LogGroup: !Ref PrepareLogGroup
+
+  ThumbnailFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-thumbnail'
+      Description: Fan-Out - genera la miniatura
+      CodeUri: src/resize/
+      Handler: app.handler
+      MemorySize: 1024
+      Timeout: 60
+      Layers: [!Ref PillowLayer]
+      Environment:
+        Variables:
+          VARIANT: thumbnail
+          MAX_SIZE: '200'
+          QUALITY: '80'
+      LoggingConfig:
+        LogGroup: !Ref ThumbnailLogGroup
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub '${ImagesBucket.Arn}/uploads/*'
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub '${ImagesBucket.Arn}/processed/*'
+
+  WebFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-web'
+      Description: Fan-Out - version optimizada para web
+      CodeUri: src/resize/
+      Handler: app.handler
+      MemorySize: 1024
+      Timeout: 60
+      Layers: [!Ref PillowLayer]
+      Environment:
+        Variables:
+          VARIANT: web
+          MAX_SIZE: '1280'
+          QUALITY: '80'
+      LoggingConfig:
+        LogGroup: !Ref WebLogGroup
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub '${ImagesBucket.Arn}/uploads/*'
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub '${ImagesBucket.Arn}/processed/*'
+
+  MobileFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-mobile'
+      Description: Fan-Out - version optimizada para mobile
+      CodeUri: src/resize/
+      Handler: app.handler
+      MemorySize: 1024
+      Timeout: 60
+      Layers: [!Ref PillowLayer]
+      Environment:
+        Variables:
+          VARIANT: mobile
+          MAX_SIZE: '640'
+          QUALITY: '70'
+      LoggingConfig:
+        LogGroup: !Ref MobileLogGroup
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub '${ImagesBucket.Arn}/uploads/*'
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub '${ImagesBucket.Arn}/processed/*'
+
+  MetadataFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-metadata'
+      Description: Fan-Out - extrae metadata tecnica
+      CodeUri: src/metadata/
+      Handler: app.handler
+      MemorySize: 512
+      Timeout: 60
+      Layers: [!Ref PillowLayer]
+      LoggingConfig:
+        LogGroup: !Ref MetadataLogGroup
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub '${ImagesBucket.Arn}/uploads/*'
+
+  ConsolidateFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-consolidate'
+      Description: Fan-In - consolida resultados y escribe el reporte JSON
+      CodeUri: src/consolidate/
+      Handler: app.handler
+      LoggingConfig:
+        LogGroup: !Ref ConsolidateLogGroup
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub '${ImagesBucket.Arn}/reports/*'
+
+  # ---------------------------------------------------------------------------
+  # Orquestador: Step Functions (Parallel = Fan-Out, estado siguiente = Fan-In)
+  # ---------------------------------------------------------------------------
+  ImageProcessingStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: !Sub '${AWS::StackName}-image-processing'
+      Type: STANDARD
+      DefinitionUri: statemachine/image_processing.asl.json
+      DefinitionSubstitutions:
+        PrepareFunctionArn: !GetAtt PrepareFunction.Arn
+        ThumbnailFunctionArn: !GetAtt ThumbnailFunction.Arn
+        WebFunctionArn: !GetAtt WebFunction.Arn
+        MobileFunctionArn: !GetAtt MobileFunction.Arn
+        MetadataFunctionArn: !GetAtt MetadataFunction.Arn
+        ConsolidateFunctionArn: !GetAtt ConsolidateFunction.Arn
+      Logging:
+        Level: ALL
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StateMachineLogGroup.Arn
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref PrepareFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref ThumbnailFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref WebFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref MobileFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref MetadataFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref ConsolidateFunction
+        - Statement:
+            - Effect: Allow
+              Action:
+                - logs:CreateLogDelivery
+                - logs:GetLogDelivery
+                - logs:UpdateLogDelivery
+                - logs:DeleteLogDelivery
+                - logs:ListLogDeliveries
+                - logs:PutResourcePolicy
+                - logs:DescribeResourcePolicies
+                - logs:DescribeLogGroups
+              Resource: '*'
+      Events:
+        ImageUploaded:
+          Type: EventBridgeRule
+          Properties:
+            Pattern:
+              source: [aws.s3]
+              detail-type: [Object Created]
+              detail:
+                bucket:
+                  name: [!Ref ImagesBucket]
+                object:
+                  key:
+                    - prefix: uploads/
+            # La ejecucion recibe solo el campo "detail" del evento
+            InputPath: $.detail
+            RetryPolicy:
+              MaximumRetryAttempts: 5
+              MaximumEventAgeInSeconds: 3600
+
+Outputs:
+  ImagesBucketName:
+    Description: Bucket de imagenes (subir a uploads/)
+    Value: !Ref ImagesBucket
+  StateMachineArn:
+    Description: ARN de la maquina de estados
+    Value: !Ref ImageProcessingStateMachine
+  ReportsPrefix:
+    Description: Ubicacion de los reportes JSON
+    Value: !Sub 's3://${ImagesBucket}/reports/'
